@@ -8,6 +8,7 @@ checked; a package is emitted only after native Windows tests have passed.
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -161,6 +162,32 @@ def llvm_options() -> list[str]:
     ]
 
 
+def llvm_recipe_sha256(script: Path | None = None) -> str:
+    """Fingerprint LLVM build logic, excluding later tests and packaging.
+
+    The audited first-run logic maps to its original whole-script digest so the
+    completed SDK can be reused after a validation-only fix. Any change to an
+    LLVM build function or relevant constant gets a different identity. Actual
+    toolchain and expanded CMake options are also independently in the key.
+    """
+    source = (script or Path(__file__)).read_text(encoding="utf-8")
+    names = {"require", "sha256", "write_json", "run", "capture", "init_msvc",
+             "verify_checkout", "common_cmake", "llvm_options", "llvm",
+             "LLVM_SHA", "LLVM_VERSION", "BACKENDS", "ROOT", "LLVM_SOURCE",
+             "BUILD", "INSTALL", "LOGS", "STATE", "JOBS"}
+    nodes = [node for node in ast.parse(source).body
+             if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names)
+             or (isinstance(node, ast.Assign) and any(
+                 isinstance(target, ast.Name) and target.id in names for target in node.targets))]
+    canonical = "\n\n".join(ast.get_source_segment(source, node) for node in nodes)
+    digest = hashlib.sha256(canonical.encode()).hexdigest()
+    # First successful LLVM build: workflow commit ff3234ff3b77551cf1b6f79b6bae3f0dbf6351dc.
+    # The original whole-file digest is for the runner's CRLF checkout.
+    if digest == "c57590b70620f878599093e7a2aa64917cf83ffed9bf4cc06cae699da51eb7cd":
+        return "9500242d7419fa3006fcfdddf2f5e2f6afe3ffdaedcfd85b2ad454ef73efa8ae"
+    return digest
+
+
 def prepare() -> None:
     toolchain = init_msvc()
     verify_checkout(SOURCE, WAMR_SHA, "wamr")
@@ -169,17 +196,18 @@ def prepare() -> None:
         require(re.search(rf"#define\s+WAMR_VERSION_{component}\s+{value}\b", header) is not None,
                 "Pinned source does not report expected WAMR version 2.4.3.")
     run(["cl", "/Bv"], "msvc-version.txt", allowed_codes=(0, 2))
-    # Hash the exact recipe as well as compiler/SDK/CRT/configuration. Do not reuse
+    # Hash LLVM build logic as well as compiler/SDK/CRT/configuration. Do not reuse
     # approximate cache matches or libraries made with another C++ toolchain.
     identity = {"llvm_sha": LLVM_SHA, "toolchain": toolchain,
-                "options": llvm_options(), "recipe_sha256": sha256(Path(__file__))}
+                "options": llvm_options(), "recipe_sha256": llvm_recipe_sha256()}
     fingerprint = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     cache_key = f"llvm-{LLVM_VERSION}-windows2022-x64-msvc-mt-{fingerprint}"
     state = {"wamr_sha": WAMR_SHA, "llvm_sha": LLVM_SHA,
              "llvm_version": LLVM_VERSION, "wamr_version": WAMR_VERSION,
              "llvm_backends": BACKENDS, "toolchain": toolchain,
              "cache_key": cache_key, "parallel_jobs": JOBS,
-             "recipe_sha256": identity["recipe_sha256"],
+             "recipe_sha256": sha256(Path(__file__)),
+             "llvm_recipe_sha256": identity["recipe_sha256"],
              "workflow_commit": os.environ.get("GITHUB_SHA"),
              "run_url": f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/"
                         f"{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/"
@@ -235,6 +263,8 @@ def verify_sdk() -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     require(manifest["cache_key"] == state["cache_key"], "LLVM cache configuration mismatch.")
     require(manifest["llvm_sha"] == LLVM_SHA, "LLVM cache source mismatch.")
+    require(manifest["toolchain"] == state["toolchain"], "LLVM cache toolchain mismatch.")
+    require(manifest["configuration"] == llvm_options(), "LLVM cache CMake configuration mismatch.")
     actual_files = {item.relative_to(INSTALL).as_posix()
                     for item in INSTALL.rglob("*") if item.is_file() and item != manifest_path}
     require(actual_files == set(manifest["sdk_file_sha256"]), "LLVM cache file inventory mismatch.")
@@ -287,7 +317,10 @@ def check_pe(executable: Path, label: str) -> list[str]:
     # including MSVCP/VCRUNTIME, MinGW libraries, LLVM, zlib, or DIA components.
     allowed = {"kernel32.dll", "advapi32.dll", "bcrypt.dll", "ntdll.dll", "ole32.dll",
                "shell32.dll", "user32.dll", "ws2_32.dll", "pathcch.dll", "psapi.dll",
-               "version.dll", "shlwapi.dll", "oleaut32.dll", "crypt32.dll", "secur32.dll"}
+               "version.dll", "shlwapi.dll", "oleaut32.dll", "crypt32.dll", "secur32.dll",
+               # Windows path API set, documented by Microsoft; no wildcard allowance.
+               # https://learn.microsoft.com/en-us/uwp/win32-and-com/win32-apis
+               "api-ms-win-core-path-l1-1-0.dll"}
     unexpected = [dll for dll in dependencies if dll.lower() not in allowed]
     require(not unexpected, f"{label} needs unapproved runtime DLLs: {unexpected}")
     return dependencies

@@ -1,6 +1,7 @@
 """Offline tests of the recipe; these do not compile or execute Windows code."""
 
 import importlib.util
+import copy
 import json
 from pathlib import Path
 import struct
@@ -36,6 +37,60 @@ class RecipeTests(unittest.TestCase):
         self.assertIn("-DLLVM_BUILD_LLVM_DYLIB=OFF", options)
         self.assertIn("-DLLVM_LINK_LLVM_DYLIB=OFF", options)
         self.assertIn("-DLLVM_PARALLEL_LINK_JOBS=1", options)
+
+    def test_llvm_cache_reuses_audited_first_run(self):
+        self.assertEqual(builder.llvm_recipe_sha256(),
+                         "9500242d7419fa3006fcfdddf2f5e2f6afe3ffdaedcfd85b2ad454ef73efa8ae")
+
+    def test_llvm_cache_ignores_validation_only_edits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "build.py"
+            source = SCRIPT.read_text().replace('"secur32.dll",', '"secur32.dll", "test-validation.dll",')
+            script.write_text(source)
+            self.assertEqual(builder.llvm_recipe_sha256(script), builder.llvm_recipe_sha256())
+
+    def test_llvm_cache_invalidates_build_changes(self):
+        for old, new in (("-DLLVM_ENABLE_ASSERTIONS=OFF", "-DLLVM_ENABLE_ASSERTIONS=ON"),
+                         ('LLVM_VERSION = "18.1.8"', 'LLVM_VERSION = "18.1.9"'),
+                         ('shutil.rmtree(out)', 'shutil.rmtree(out, ignore_errors=True)')):
+            with self.subTest(old=old), tempfile.TemporaryDirectory() as directory:
+                script = Path(directory) / "build.py"
+                script.write_text(SCRIPT.read_text().replace(old, new))
+                self.assertNotEqual(builder.llvm_recipe_sha256(script), builder.llvm_recipe_sha256())
+
+    def test_sdk_verifies_configuration_and_integrity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            install, logs = root / "sdk", root / "logs"
+            install.mkdir()
+            logs.mkdir()
+            (install / "build-evidence").mkdir()
+            library = install / "LLVMCore.lib"
+            library.write_bytes(b"verified fixture")
+            state = {"cache_key": "test-key", "toolchain": {"crt": "MultiThreaded (/MT)"}}
+            builder.write_json(logs / "build-state.json", state)
+            manifest = {"cache_key": "test-key", "llvm_sha": builder.LLVM_SHA,
+                        "toolchain": state["toolchain"], "configuration": builder.llvm_options(),
+                        "sdk_file_sha256": {"LLVMCore.lib": builder.sha256(library)}}
+            with patch.object(builder, "STATE", logs / "build-state.json"), \
+                    patch.object(builder, "INSTALL", install), patch.object(builder, "LOGS", logs):
+                # Options contain INSTALL, so evaluate them after patching the path.
+                manifest["configuration"] = builder.llvm_options()
+                builder.write_json(install / "wamrc-sdk-provenance.json", manifest)
+                builder.verify_sdk()
+                for key, bad, message in (("toolchain", {}, "toolchain mismatch"),
+                                          ("configuration", [], "configuration mismatch"),
+                                          ("sdk_file_sha256", {}, "inventory mismatch")):
+                    with self.subTest(key=key):
+                        altered = copy.deepcopy(manifest)
+                        altered[key] = bad
+                        builder.write_json(install / "wamrc-sdk-provenance.json", altered)
+                        with self.assertRaisesRegex(RuntimeError, message):
+                            builder.verify_sdk()
+                builder.write_json(install / "wamrc-sdk-provenance.json", manifest)
+                library.write_bytes(b"corrupt fixture")
+                with self.assertRaisesRegex(RuntimeError, "file mismatch"):
+                    builder.verify_sdk()
 
     def test_wasm_structure_and_constant(self):
         data = builder.WASM_BYTES
@@ -80,10 +135,18 @@ class RecipeTests(unittest.TestCase):
     def test_pe_dynamic_crt_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             pe = self.make_pe(directory)
-            for dependency in ("VCRUNTIME140.dll", "MSVCP140.dll", "libwinpthread-1.dll", "LLVM.dll"):
+            for dependency in ("VCRUNTIME140.dll", "MSVCP140.dll", "libwinpthread-1.dll", "LLVM.dll",
+                               "api-ms-win-crt-runtime-l1-1-0.dll", "api-ms-win-unknown.dll"):
                 with patch.object(builder, "run", return_value=f"    KERNEL32.dll\n    {dependency}\n"):
                     with self.assertRaisesRegex(RuntimeError, "unapproved runtime DLLs"):
                         builder.check_pe(pe, "test")
+
+    def test_pe_windows_path_api_set_allowed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pe = self.make_pe(directory)
+            dependency = "api-ms-win-core-path-l1-1-0.dll"
+            with patch.object(builder, "run", return_value=f"    KERNEL32.dll\n    {dependency}\n"):
+                self.assertEqual(builder.check_pe(pe, "test"), ["KERNEL32.dll", dependency])
 
     def test_non_x64_pe_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

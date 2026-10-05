@@ -9,6 +9,10 @@ Extract the complete directory. In Command Prompt:
   wamrc.exe --version
   tests\smoke-test.cmd
 
+Use a modern Windows x64 system. The executable imports the built-in Windows
+path API set (api-ms-win-core-path-l1-1-0.dll); Windows 7 is not supported.
+Native runtime testing was performed on Windows Server 2022, not every Windows version.
+
 Basic use:
   wamrc.exe -o output.aot input.wasm
 

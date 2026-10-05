@@ -87,12 +87,18 @@ silently. It only removes its own generated LLVM object tree after successful
 installation; source trees are not deleted.
 
 The installed LLVM SDK cache can be hundreds of MB to a few GB. Its key includes
-the full LLVM SHA, all options, script hash, exact MSVC/Windows SDK versions,
+the full LLVM SHA, all options, LLVM build-logic hash, exact MSVC/Windows SDK versions,
 CMake/Ninja versions, static CRT, host/target architecture and installation path.
 No approximate fallback cache is restored. A manifest verifies the complete
 cached SDK file inventory and every SHA-256 before linking. Cache save happens immediately after a complete
 LLVM build so a later WAMR failure does not discard that work. Compilation logs
 and the originating run URL are retained inside the cache's build evidence.
+
+Validation-only or packaging-only fixes preserve that expensive SDK cache. The
+audited LLVM build logic from workflow commit `ff3234ff` maps to its original
+whole-script digest; changing an LLVM build function or relevant constant changes
+the identity. Cache verification also compares exact toolchain and CMake options.
+The full current build-script hash is still recorded separately in build state.
 
 Artifacts expire after 14 days; diagnostic logs after 7 days. Cache availability,
 eviction, build minutes and storage charges follow the repository's current plan.
