@@ -1,0 +1,9 @@
+_src/
+_build/
+_llvm18-msvc/
+_logs/
+_package/
+_package-verification/
+dist/
+__pycache__/
+*.pyc

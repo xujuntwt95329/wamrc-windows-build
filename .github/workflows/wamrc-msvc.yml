@@ -1,0 +1,118 @@
+name: Build pinned wamrc with MSVC
+
+# Manual only. Adding another trigger requires the repository owner's approval.
+'on':
+  workflow_dispatch:
+    inputs:
+      parallel_jobs:
+        description: 'Parallel compile jobs (2 is conservative on private-repository runners)'
+        required: true
+        type: choice
+        default: '2'
+        options: ['2', '4']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wamrc-msvc-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 350
+    env:
+      BUILD_JOBS: ${{ inputs.parallel_jobs }}
+      PYTHONUNBUFFERED: '1'
+      # Process-local Git configuration, needed for some LLVM source paths.
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: core.longpaths
+      GIT_CONFIG_VALUE_0: 'true'
+    steps:
+      - name: Check out the reviewed build recipe
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2, verified 2026-10-05
+        with:
+          persist-credentials: false
+
+      - name: Check out the exact unmodified WAMR commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: wasm-micro-runtime/wasm-micro-runtime
+          ref: 2b25b20474eaf85e1358f9b795de6b2da267cb7a
+          path: _src/wamr
+          fetch-depth: 1
+          submodules: false
+          persist-credentials: false
+
+      - name: Check sources, select VS 2022 x64, and identify the cache
+        id: prepare
+        run: python scripts/wamrc_msvc/build.py prepare
+
+      - name: Restore matching MSVC LLVM development libraries
+        id: llvm-cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5, verified 2026-10-05
+        with:
+          path: _llvm18-msvc
+          key: ${{ steps.prepare.outputs.cache_key }}
+          # Deliberately no restore-keys: incompatible CRT/compiler caches are unsafe.
+
+      - name: Check out the exact LLVM 18.1.8 source on a cache miss
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: llvm/llvm-project
+          ref: 3b5b5c1ec4a3095ab096dd780e84d7ab81f3d7ff
+          path: _src/llvm-project
+          fetch-depth: 1
+          sparse-checkout: |
+            llvm
+            cmake
+            third-party
+          persist-credentials: false
+
+      - name: Build and install Release static LLVM development libraries
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 285
+        run: python scripts/wamrc_msvc/build.py llvm
+
+      - name: Save complete LLVM libraries before the WAMR build
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: _llvm18-msvc
+          key: ${{ steps.prepare.outputs.cache_key }}
+
+      - name: Build wamrc and the native x64 test runtime
+        timeout-minutes: 35
+        run: python scripts/wamrc_msvc/build.py wamrc
+
+      - name: Execute Windows version and AOT smoke tests
+        timeout-minutes: 10
+        run: python scripts/wamrc_msvc/build.py test
+
+      - name: Package, hash, and verify the archive
+        timeout-minutes: 10
+        run: python scripts/wamrc_msvc/build.py package
+
+      - name: Upload the verified delivery archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7, verified 2026-10-05
+        with:
+          name: wamrc-2b25b204-windows-x64-msvc
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload diagnostics even if compilation or testing fails
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: wamrc-msvc-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: _logs/*
+          if-no-files-found: warn
+          retention-days: 7
